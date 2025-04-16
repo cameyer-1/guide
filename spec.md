@@ -450,6 +450,93 @@ This setup provides a robust, scalable, and secure way to ingest your data, main
 %%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
 %%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
 
+Okay, here is a sequence diagram illustrating the flow for the POST request, incorporating the IAM authorization check, Lambda processing, and interactions with S3 and Glue for both the PIT and LATEST tables.
+
+We'll use Mermaid syntax, which is commonly used for text-based diagrams.
+
+```mermaid
+sequenceDiagram
+    participant C as Client (IAM User/Role)
+    participant APIGW as API Gateway
+    participant IAM as AWS IAM Service
+    participant L as Lambda (Chalice App)
+    participant S3 as S3 Bucket (df-trusted-prod-data)
+    participant Glue as Glue Data Catalog
+
+    C->>+APIGW: POST /v1/security-of-interest/business-unit/{business_unit} \n (Request Body, Signed w/ AWS Credentials)
+
+    APIGW->>+IAM: Validate Caller Credentials & Permissions
+    Note over APIGW, IAM: Check if caller's policy allows 'execute-api:Invoke' on the specific resource ARN (e.g., .../POST/v1/.../business-unit/AE)
+    IAM-->>-APIGW: Authorization Decision (Allow/Deny)
+
+    alt Authorized
+        APIGW->>+L: Invoke Function (Passes path params, body, context)
+        L->>L: Parse business_unit from path
+        L->>L: Validate business_unit against Enum
+        L->>L: Parse and validate request body (Pydantic ApiRequestModel)
+        L->>L: Get current date
+        L->>L: Transform request into DataFrame (DatabaseRow format) \n (Adds business_unit, dates, etc.)
+
+        Note over L: Using awswrangler for S3/Glue operations
+
+        %% --- PIT Table Interaction ---
+        L->>+S3: wr.s3.to_parquet (PIT) \n Path: s3://.../security_of_interest_pit/ \n Mode: append \n Partitions: business_unit, request_date \n Data: DataFrame
+        S3-->>-L: Parquet file(s) written to S3
+        L->>+Glue: wr.s3.to_parquet (PIT) \n Updates Glue Table: security_of_interest_pit \n Action: Add/update partitions (e.g., business_unit=AE/request_date=YYYY-MM-DD)
+        Glue-->>-L: Catalog Updated (PIT)
+
+        %% --- LATEST Table Interaction ---
+        Note right of L: 'overwrite_partitions' mode first deletes existing objects in the target partition(s).
+        L->>+S3: wr.s3.to_parquet (LATEST) - Step 1: Delete \n Path: s3://.../security_of_interest_latest/business_unit={business_unit}/ \n Action: Delete existing objects in this prefix
+        S3-->>-L: Existing partition objects deleted
+        L->>+S3: wr.s3.to_parquet (LATEST) - Step 2: Write \n Path: s3://.../security_of_interest_latest/ \n Mode: overwrite_partitions \n Partitions: business_unit \n Data: DataFrame (same data as PIT write)
+        S3-->>-L: New Parquet file(s) written to S3 partition
+        L->>+Glue: wr.s3.to_parquet (LATEST) \n Updates Glue Table: security_of_interest_latest \n Action: Ensure partition exists (business_unit={business_unit}), update table metadata if needed
+        Glue-->>-L: Catalog Updated (LATEST)
+
+        L->>L: Prepare Success Response (HTTP 201)
+        L-->>-APIGW: Return Success Response
+
+        APIGW-->>-C: HTTP 201 Created Response
+
+    else Denied (Not Authorized)
+        APIGW-->>-C: HTTP 403 Forbidden Response
+    end
+```
+
+**Explanation of the Diagram:**
+
+1.  **Client Request:** The IAM User (or an application using an IAM Role) sends a POST request, signed with their AWS credentials, to the specific API Gateway endpoint.
+2.  **IAM Authorization:** API Gateway intercepts the request and validates the signature and associated IAM policy against the AWS IAM service. It checks if the policy attached to the caller's user/role grants `execute-api:Invoke` permission on the *exact* resource ARN requested (e.g., `/v1/security-of-interest/business-unit/AE`).
+3.  **Conditional Flow (Auth):**
+    *   If **Denied**, API Gateway immediately returns a 403 Forbidden error.
+    *   If **Authorized**, API Gateway proceeds to invoke the backend Lambda function.
+4.  **Lambda Invocation:** API Gateway passes the request details (headers, path parameters like `{business_unit}`, the request body, and context like caller identity) to the Chalice Lambda function.
+5.  **Lambda Processing:**
+    *   The function validates the path parameter and request body using Pydantic.
+    *   It transforms the incoming data into the target `DatabaseRow` structure, creating a Pandas DataFrame. This includes adding the `business_unit` from the path and the current `request_date`/`last_updated_date`.
+6.  **PIT Table Write (Append):**
+    *   The Lambda uses `awswrangler` to write the DataFrame to the `security_of_interest_pit` location in S3.
+    *   `mode="append"` ensures existing data isn't touched.
+    *   `partition_cols=["business_unit", "request_date"]` tells `awswrangler` to structure the S3 path and update Glue accordingly (e.g., `s3://.../business_unit=AE/request_date=2023-10-27/file.parquet`).
+    *   `awswrangler` interacts with Glue to register these new partitions in the `security_of_interest_pit` table.
+7.  **LATEST Table Write (Overwrite Partitions):**
+    *   The Lambda uses `awswrangler` again, but this time targeting the `security_of_interest_latest` location and table.
+    *   `mode="overwrite_partitions"` tells `awswrangler` to replace data *only* for the partition(s) present in the *current* DataFrame being written. Since the DataFrame contains data only for the single `business_unit` from the URL, `awswrangler` first *deletes* all existing S3 objects under the corresponding S3 prefix (e.g., `s3://.../security_of_interest_latest/business_unit=AE/`).
+    *   Then, it writes the *new* Parquet file(s) for that `business_unit` partition.
+    *   `partition_cols=["business_unit"]` is used here.
+    *   `awswrangler` interacts with Glue to ensure the `business_unit` partition exists and points to the new data in the `security_of_interest_latest` table.
+8.  **Response:** The Lambda prepares a success (HTTP 201 Created) response.
+9.  **Return Flow:** The Lambda returns the response to API Gateway, which relays it back to the original Client.
+
+This diagram shows the clear separation of concerns and the specific interactions needed to maintain both the historical (PIT) and current-state (LATEST) views of the data, triggered by a single, authorized API call.
+
+%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+
 Okay, let's break down the execution flow step-by-step, starting from the moment the user sends the request:
 
 **Phase 1: Request Initiation & API Gateway Handling**
