@@ -1,531 +1,551 @@
-The task is to produce tables that are accessible through AWS Athena, where the table data will be stored in AWS S3.
-There are two tables: security_of_interest_pit (where PIT stands for point in time, more on this later) and security_of_interest_latest. These tables will exist in the database 'df_trusted_${env}`.
-
-The data fields will be:
-- reference_id: This will be the security_id provided by the user in the REST API, it will be integers that map to a stock ticker.
-- business_unit: This will be the team requesting the change (via the REST API). Some examples of business_unit is AE, or CMF
-- package_name: This will be a job name, something that the User provides in their request. This is just some string to further group the requests.
-- request_date: This will be the date the request was made e.g. 2024-05-16
-
-Both of them will contain the same data. But, unlike security_of_interest_pit, security_of_interest_latest will only contain the latest
-(business_unit, package_name) pair when querying via Athena. 
-
-For example: If User wants the following:
+I want to set up an API on AWS, it'll just be single POST endpoint where the request follows this RequestModel:
 ```
-reference_id(s): [123, 456]
-business_unit: AE
-package_name: job_1
-request_date: [Implicitly calculated to be today]
+from pydantic import BaseModel
+from datetime import date
+from enum import Enum
+
+
+class Department(str, Enum):
+    AE = "AE"
+    CMF = "CMF"
+    ABC = "ABC"
+    GG = "GG"
+	ADMIN = "ADMIN"
+
+# Reference model
+class Reference(BaseModel):
+    id: str
+    type: str
+
+# Package model
+class Package(BaseModel):
+    name: str
+    references: list[Reference]
+
+# Request model
+class RequestModel(BaseModel):
+    packages: list[Package]
+    business_unit: Department
+    requested_by: Department
+    last_updated_by: Department
+    request_date: date
+    last_updated_date: date
+	
+class DatabaseRow(BaseModel):
+	reference_id: str
+	reference_type: str
+	package: str
+	business_unit: Department
+	requested_by: Department
+    last_updated_by: Department
+    request_date: date
+    last_updated_date: date
 ```
-Only to change their mind a few minutes later to only be:
+
+The POST request will take the RequestModel object, and turn it into a DB row to be stored in AWS, so that its queryable with AWS Athena. My team uses Chalice for exposing endpoints. I want to store this stuff as parquet for Athena to read. The database will be df_trusted_prod and the table will be security_of_interest_pit where pit stands for Point in Time, and the bucket will use the same naming scheme.
+
+The business_unit which will be part of the endpoint, e.g. POST /v1/security-of-interest/business-unit/{business_unit}/
+The request_date and last_updated_date will be the same value, and they will be inferred from the date the request was made.
+
+I am interested in seeing how AWS IAM is set up so that only users of that department can make a call for their business_unit. Assume that for each entry: business_unit, requested_by, and last_updated_by will always be the same value for now.
+Assume business_unit, requested_by, and last_updated_by won't be in the request, as they will be inferred from the endpoint URL.
+
+Next, lets say i want to maintain another table alongside this one, called `security_of_interest_latest`. While they will be structurally the same, the difference between `security_of_interest_latest` and `security_of_interest_pit` is that `security_of_interest_latest` will only contain the latest request for any (business_unit, package) pair. For example, the caller first makes the request:
 ```
-reference_id(s): [123]
-business_unit: AE
-package_name: job_1
-request_date: [Implicitly calculated to be today]
+POST /dev/v1/security-of-interest/business-unit/AE/ HTTP/1.1
+
+{
+  "packages": [
+    {
+      "name": "Equity_Swaps_Package_1",
+      "references": [
+        {"id": "REF123", "type": "ISIN"},
+        {"id": "REF456", "type": "CUSIP"}
+      ]
+    },
+    {
+      "name": "Options_Package_A",
+      "references": [
+        {"id": "REF789", "type": "SEDOL"}
+      ]
+    }
+  ]
+}
 ```
-My Athena queries would return the latest one with only 123 in the reference_id list for that (business_unit, package_name).
+This would create three rows, one for each reference.
+But 10 minutes later, he changes his mind and wants to remove a reference from "Equity_Swaps_Package_1" by sending this request:
+```
+POST /dev/v1/security-of-interest/business-unit/AE/ HTTP/1.1
 
-The high level "flow" will go as follows:
+{
+  "packages": [
+    {
+      "name": "Equity_Swaps_Package_1",
+      "references": [
+        {"id": "REF123", "type": "ISIN"}
+      ]
+    }
+  ]
+}
+```
+This will overwrite everything for that business_unit, it will go from three reference rows down to just one.
 
-1) User will interact with our REST API, which will expose a POST endpoint. The user will indicate the business_unit, the package_name, and a list of
-reference_id
-2) Our REST API will take that payload and write that into S3 so that its available for query in AWS Athena at those tables.
+Presumably, this chalice configuration and backend will be hosted on lambda. Show me the backend code for this, along with the Athena schema.
 
-Some other things to note, the business_unit will/must correspond with the user that makes the call, they refer to the team they belong to. So only a user who is part of the AE team can make a call associated with the business_unit so im not sure if this is better in the endpoint URL or as part of the payload.
+%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
 
-Each business_unit will probably have thousands of package_name and there may be hundreds of reference_id per package_name, so i imagine there will be millions of rows.
+Okay, let's set up this Chalice API, S3 storage with Parquet, Athena tables, and the IAM structure.
 
-While business_units must already exist (e.g. AE is an existing business_unit so its valid but XYZ isn't and would fail), this endpoint would be responsible for creating new package_name and the package_name will contain some list of reference_ids.
+We'll use the `awswrangler` library, which significantly simplifies writing partitioned Parquet files to S3 and managing Glue Data Catalog tables (which Athena uses).
 
-To start: How would you design the endpoint? The endpoint should be robust and should be able to accept multiple package_names, and each package_name should support multiple reference_ids
+**1. Project Setup & Dependencies**
 
-I want something that is stable for the long-term that is extendable, and generalizable
+Make sure you have Chalice and the necessary libraries installed:
 
-≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈
-≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈ BREAK ≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈
-≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈
+```bash
+pip install chalice boto3 pandas pyarrow awswrangler pydantic
+```
 
-Okay, let's break down the design for the API endpoint, S3 storage, and Athena tables.
+Create a Chalice project (if you haven't already):
 
-**1. API Endpoint Design**
+```bash
+chalice new-project security-of-interest-api
+cd security-of-interest-api
+```
 
-Given the requirements (robust, extendable, generalizable, handling multiple packages, associating `business_unit` with the user), here's a proposed design:
+Your `requirements.txt` should include:
 
-*   **Method:** `POST` - This is appropriate as the user is submitting a new state or "event" for one or more packages.
-*   **URL Structure:** `/api/v1/security-of-interest/{business_unit}`
-    *   Using `business_unit` as a path parameter makes sense for several reasons:
-        *   It clearly defines the scope of the resource being affected.
-        *   It facilitates authorization: You can easily check if the authenticated user making the call belongs to the `{business_unit}` specified in the path *before* processing the payload.
-        *   It aligns with REST principles where the path identifies the resource hierarchy.
-*   **Authentication/Authorization:** Use AWS IAM, Cognito, or a similar mechanism. The API Gateway (or the backend service) needs to:
-    1.  Authenticate the user.
-    2.  Determine the user's associated `business_unit`(s).
-    3.  Verify that the `business_unit` in the URL path matches (or is one of) the user's allowed units. If not, return `403 Forbidden`.
-    4.  Verify that the `business_unit` in the path is a valid, existing unit. If not, return `404 Not Found` or `400 Bad Request`.
-*   **Request Body:** A JSON array of objects, where each object represents a package and its associated securities. This allows submitting updates for multiple packages in a single call.
+```
+chalice
+boto3
+pandas
+pyarrow
+awswrangler
+pydantic
+```
 
-    ```json
-    // POST /api/v1/security-of-interest/AE
-    [
-      {
-        "package_name": "job_1",
-        "reference_ids": [123]
-      },
-      {
-        "package_name": "critical_daily_report",
-        "reference_ids": [789, 1011, 1213]
-      }
-      // ... more package objects if needed
-    ]
-    ```
+**2. Chalice Application Code (`app.py`)**
 
-*   **Request Body Validation:**
-    *   The body must be a non-empty JSON array.
-    *   Each object in the array must contain:
-        *   `package_name`: String, non-empty. Define reasonable length limits and allowed characters if necessary.
-        *   `reference_ids`: Array of integers, must contain at least one integer. Ensure they are actual integers.
-*   **Response Codes:**
-    *   `202 Accepted`: The request is valid and has been accepted for processing (S3 write might happen asynchronously). You could return a request ID for tracking.
-    *   `400 Bad Request`: Invalid JSON, missing fields, empty arrays, invalid data types (`reference_ids` not integers, etc.), invalid `business_unit` format (if checked here instead of 404).
-    *   `401 Unauthorized`: User is not authenticated.
-    *   `403 Forbidden`: User is authenticated but not authorized to submit for the specified `business_unit`.
-    *   `404 Not Found`: The specified `business_unit` does not exist in your system.
-    *   `500 Internal Server Error`: Backend processing error (e.g., failed to write to S3).
+```python
+import os
+import logging
+from datetime import date
+from enum import Enum
+from typing import List
 
-**2. S3 Storage Design**
+import awswrangler as wr
+import pandas as pd
+from chalice import Chalice, Response, IAMAuthorizer, BadRequestError, ChaliceViewError
+from pydantic import BaseModel, Field, ValidationError
 
-To support both PIT and Latest views efficiently in Athena, we need a well-structured and partitioned layout.
+# --- Configuration ---
+# Best practice: Load from environment variables
+S3_BUCKET = os.environ.get("S3_BUCKET", "df-trusted-prod-data") # Example bucket name
+GLUE_DATABASE = os.environ.get("GLUE_DATABASE", "df_trusted_prod")
+PIT_TABLE_NAME = "security_of_interest_pit"
+LATEST_TABLE_NAME = "security_of_interest_latest"
+S3_PIT_PREFIX = f"s3://{S3_BUCKET}/{PIT_TABLE_NAME}/"
+S3_LATEST_PREFIX = f"s3://{S3_BUCKET}/{LATEST_TABLE_NAME}/"
 
-*   **Bucket:** Choose a suitable S3 bucket, e.g., `s3://your-company-datalake-${env}/`
-*   **Base Path:** `trusted/security-of-interest/` (Using 'trusted' implies some level of cleansing/validation has occurred).
-*   **File Format:** **Parquet**. This is crucial for Athena performance and cost-effectiveness. It's columnar, supports compression (Snappy or Gzip), and handles schema evolution.
-*   **Partitioning Strategy:** Partitioning is key to pruning data scanned by Athena, especially for the `_latest` view logic and time-based queries on `_pit`.
-    *   **Primary Partition:** `business_unit` - This aligns with the API structure and likely query patterns.
-    *   **Secondary Partitions:** Date-based - `year`, `month`, `day`. This allows efficient time-series analysis on the `_pit` table and helps isolate data for potential reprocessing or management.
-    *   **Example S3 Object Path:**
-        `s3://your-company-datalake-${env}/trusted/security-of-interest/business_unit=AE/year=2024/month=05/day=16/some-unique-id-part-00000.parquet`
-*   **Data Structure within Parquet Files:** Each row in the Parquet file will represent *one complete submission event* for a specific `(business_unit, package_name)` pair at a point in time.
+# Set up logging
+logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')
+logger = logging.getLogger(__name__)
 
-    *   `package_name`: STRING
-    *   `reference_ids`: ARRAY<INT> (Storing the list directly as an array is efficient for retrieval).
-    *   `event_timestamp`: TIMESTAMP (Crucial! Use a high-precision timestamp, e.g., `YYYY-MM-DD HH:MM:SS.sss`, generated server-side when the request is processed. This is needed to determine the *absolute latest* record if multiple updates occur on the same day).
-    *   `request_date`: DATE (Can be derived from `event_timestamp`, useful for partitioning and simple date filtering, store as YYYY-MM-DD).
-    *   *(Optional but Recommended):* `request_id` (STRING - link back to the API request), `user_id` (STRING - who made the request).
+# --- Pydantic Models ---
 
-*   **How Data is Written:**
-    1.  When the API receives a request like the example above for `business_unit=AE`:
-    2.  It generates a precise `event_timestamp` (e.g., `2024-05-16 10:30:05.123`).
-    3.  It extracts the `request_date` (`2024-05-16`).
-    4.  It creates *two* records (because the request had two package objects):
-        *   Record 1: `package_name="job_1"`, `reference_ids=[123]`, `event_timestamp="2024-05-16 10:30:05.123"`, `request_date="2024-05-16"`
-        *   Record 2: `package_name="critical_daily_report"`, `reference_ids=[789, 1011, 1213]`, `event_timestamp="2024-05-16 10:30:05.123"`, `request_date="2024-05-16"`
-    5.  These records are written to a Parquet file (or multiple files if the payload is huge) in the corresponding S3 partition: `s3://.../business_unit=AE/year=2024/month=05/day=16/`
+class Department(str, Enum):
+    AE = "AE"
+    CMF = "CMF"
+    ABC = "ABC"
+    GG = "GG"
+    ADMIN = "ADMIN" # Added ADMIN based on your model definition
 
-**3. Athena Table Definitions**
+# Reference model (part of the incoming request)
+class Reference(BaseModel):
+    id: str
+    type: str
 
-In the `df_trusted_${env}` database:
+# Package model (part of the incoming request)
+class Package(BaseModel):
+    name: str
+    references: list[Reference]
 
-*   **Table 1: `security_of_interest_pit` (Point-In-Time)**
-    *   This table directly maps to the S3 data and shows all historical records.
-    *   Type: External Table
+# Actual Request model for the API (doesn't include inferred fields)
+class ApiRequestModel(BaseModel):
+    packages: list[Package]
 
-    ```sql
-    CREATE EXTERNAL TABLE `df_trusted_${env}`.`security_of_interest_pit`(
-      `package_name` string,
-      `reference_ids` array<int>,
-      `event_timestamp` timestamp,
-      `request_date` date -- Or string if preferred, matches data type in Parquet
-      -- Optional: `request_id` string, `user_id` string
-      )
-    PARTITIONED BY (
-      `business_unit` string,
-      `year` string,
-      `month` string,
-      `day` string)
-    ROW FORMAT SERDE
-      'org.apache.hadoop.hive.ql.io.parquet.serde.ParquetHiveSerDe'
-    STORED AS INPUTFORMAT
-      'org.apache.hadoop.hive.ql.io.parquet.MapredParquetInputFormat'
-    OUTPUTFORMAT
-      'org.apache.hadoop.hive.ql.io.parquet.MapredParquetOutputFormat'
-    LOCATION
-      's3://your-company-datalake-${env}/trusted/security-of-interest/'
-    TBLPROPERTIES (
-      'parquet.compression'='SNAPPY', -- Or GZIP
-      'classification'='parquet'
-    );
-    ```
-    *   **Partition Management:** You need a way to add new partitions as data arrives daily. Options:
-        *   **AWS Glue Crawler:** Schedule a crawler to run periodically (e.g., hourly or daily) to detect and add new partitions.
-        *   **`MSCK REPAIR TABLE df_trusted_${env}.security_of_interest_pit;`:** Run this command manually or via a scheduled Lambda/Step Function after data is written.
-        *   **Event-Driven:** S3 Event Notification -> Lambda -> `ALTER TABLE ADD PARTITION` command (most immediate, slightly more complex setup).
+# Target Database Row structure (used for DataFrame and Parquet schema)
+class DatabaseRow(BaseModel):
+    reference_id: str
+    reference_type: str
+    package: str
+    business_unit: Department
+    requested_by: Department
+    last_updated_by: Department
+    request_date: date
+    last_updated_date: date
 
-*   **Table 2: `security_of_interest_latest`**
-    *   This table provides a view showing only the most recent record for each `(business_unit, package_name)` combination.
-    *   Type: **Athena View** (This avoids data duplication and computes the latest state on the fly)
+# --- Chalice App ---
 
-    ```sql
-    CREATE OR REPLACE VIEW `df_trusted_${env}`.`security_of_interest_latest` AS
-    SELECT
-      package_name,
-      reference_ids,
-      event_timestamp,
-      request_date,
-      business_unit -- Important to include partition columns in the view output
-    FROM (
-      SELECT
-        pit.package_name,
-        pit.reference_ids,
-        pit.event_timestamp,
-        pit.request_date,
-        pit.business_unit, -- Select partition columns from the source table
-        -- Assign a rank to each record within a BU/Package group, ordered by time DESC
-        ROW_NUMBER() OVER (
-          PARTITION BY pit.business_unit, pit.package_name
-          ORDER BY pit.event_timestamp DESC
-        ) as rn
-      FROM
-        `df_trusted_${env}`.`security_of_interest_pit` pit
-    ) ranked_pit
-    WHERE
-      rn = 1; -- Select only the latest record (rank=1) for each group
-    ```
+app = Chalice(app_name='security-of-interest-api')
+# Use AWS IAM for authorization
+authorizer = IAMAuthorizer()
 
-    *   **How it works:** The `ROW_NUMBER()` window function assigns a rank to each record within the partition defined by `business_unit` and `package_name`. The `ORDER BY event_timestamp DESC` ensures the most recent record gets rank 1. The outer query filters for `rn = 1`.
-    *   **Performance:** When you query the `security_of_interest_latest` view with a filter like `WHERE business_unit = 'AE'`, Athena is smart enough to push down the predicate to the underlying `security_of_interest_pit` table, utilizing the S3 partitioning to scan only the data for `business_unit=AE`. It will still need to scan all historical data *within* that partition (across all dates) to find the latest `event_timestamp` for each `package_name` within that business unit, but this is generally efficient enough, especially with Parquet.
+@app.route('/v1/security-of-interest/business-unit/{business_unit}', methods=['POST'], authorizer=authorizer)
+def update_security_of_interest(business_unit: str):
+    """
+    Receives security of interest data for a specific business unit,
+    validates it, transforms it, and stores it in S3 for Athena.
+    Updates both PIT (Point-in-Time) and LATEST tables.
+    """
+    # --- Input Validation ---
+    try:
+        # Validate business_unit from path against the Enum
+        business_unit_enum = Department(business_unit.upper())
+        logger.info(f"Processing request for business_unit: {business_unit_enum.value}")
+    except ValueError:
+        logger.error(f"Invalid business_unit provided in path: {business_unit}")
+        raise BadRequestError(f"Invalid business_unit: '{business_unit}'. Must be one of {list(Department.__members__.keys())}")
 
-**Summary of Flow:**
+    try:
+        # Parse and validate the request body
+        request_data = ApiRequestModel.parse_obj(app.current_request.json_body)
+        logger.info(f"Received {len(request_data.packages)} packages in the request.")
+    except ValidationError as e:
+        logger.error(f"Request body validation failed: {e}")
+        raise BadRequestError(f"Invalid request body: {e}")
+    except Exception as e:
+        logger.error(f"Could not parse request body: {e}")
+        raise BadRequestError("Could not parse request body. Ensure it's valid JSON.")
 
-1.  User POSTs to `/api/v1/security-of-interest/{business_unit}` with `[{"package_name": "p1", "reference_ids": [...]}, ...]`.
-2.  API authenticates/authorizes user against `{business_unit}`.
-3.  API validates the payload.
-4.  API generates `event_timestamp`, determines `request_date`, `year`, `month`, `day`.
-5.  For *each* object in the payload array, API prepares a record (`package_name`, `reference_ids`, `event_timestamp`, `request_date`).
-6.  API writes these records into one or more Parquet files in the correct S3 partition (`s3://.../business_unit=.../year=.../month=.../day=.../`).
-7.  Partition discovery mechanism (Crawler, MSCK REPAIR, Lambda) updates the `security_of_interest_pit` table's partitions.
-8.  Users can query `security_of_interest_pit` for full history or `security_of_interest_latest` for the current state via Athena.
+    # --- Data Transformation ---
+    current_date = date.today()
+    db_rows = []
 
-This design provides a clear separation of concerns, leverages efficient storage (Parquet) and querying (Partitioning, Views), and creates a maintainable and extendable system.
+    if not request_data.packages:
+         logger.warning(f"Received empty packages list for business unit {business_unit_enum.value}. This will effectively clear the 'latest' data.")
+         # Even if packages list is empty, we might want to record this 'clearing' action in PIT
+         # and ensure the latest partition is overwritten with empty data. Proceeding.
 
-≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈
-≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈ BREAK ≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈
-≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈
+    for package in request_data.packages:
+        if not package.references:
+            logger.warning(f"Package '{package.name}' has an empty references list. Skipping references for this package.")
+            # Decide if a package with no references should still exist in 'latest' or be removed.
+            # Current logic: If a package is listed with no references, it means *remove* all previous references for this package.
+            # If the intent is different, adjust logic here.
 
-Okay, let's break down the "Athena Table Definitions" section in more detail, assuming little prior AWS/Athena knowledge.
+        for reference in package.references:
+            row_data = {
+                "reference_id": reference.id,
+                "reference_type": reference.type,
+                "package": package.name,
+                "business_unit": business_unit_enum,
+                "requested_by": business_unit_enum, # As per requirement
+                "last_updated_by": business_unit_enum, # As per requirement
+                "request_date": current_date,
+                "last_updated_date": current_date # As per requirement
+            }
+            db_rows.append(DatabaseRow(**row_data).dict()) # Convert Pydantic model to dict
 
-**What is AWS Athena?**
+    # Create Pandas DataFrame
+    if db_rows:
+        df = pd.DataFrame(db_rows)
+        # Ensure correct data types, especially for dates
+        df['request_date'] = pd.to_datetime(df['request_date']).dt.date
+        df['last_updated_date'] = pd.to_datetime(df['last_updated_date']).dt.date
+        # Ensure enum columns are strings for Parquet/Athena compatibility
+        for col in ['business_unit', 'requested_by', 'last_updated_by']:
+             df[col] = df[col].astype(str)
+        logger.info(f"Created DataFrame with {len(df)} rows.")
+    else:
+        # Handle the case where the input results in zero rows (e.g., empty packages list)
+        # Create an empty DataFrame with the correct schema to ensure overwrites work correctly
+        df = pd.DataFrame(columns=DatabaseRow.__fields__.keys())
+        # Cast columns even if empty to ensure schema consistency if needed by wrangler
+        df = df.astype({
+            "reference_id": str, "reference_type": str, "package": str,
+            "business_unit": str, "requested_by": str, "last_updated_by": str,
+            "request_date": object, # Pandas uses object for Date columns
+            "last_updated_date": object
+        })
+        logger.info("Created empty DataFrame as no valid references were provided.")
 
-Imagine you have a massive amount of data stored in files within AWS S3 (which is like a giant, highly durable online file storage system). You want to ask questions of this data using standard SQL (Structured Query Language), just like you would with a traditional database.
 
-Athena is a service that lets you do exactly that. It's "serverless," meaning you don't manage any servers or databases yourself. You simply:
+    # --- Data Storage (S3 & Glue Data Catalog) ---
+    try:
+        # 1. Write to PIT table (Append mode, partitioned by business_unit and date)
+        logger.info(f"Writing {len(df)} rows to PIT table: {GLUE_DATABASE}.{PIT_TABLE_NAME}")
+        wr.s3.to_parquet(
+            df=df,
+            path=S3_PIT_PREFIX,
+            dataset=True,
+            database=GLUE_DATABASE,
+            table=PIT_TABLE_NAME,
+            mode="append",
+            partition_cols=["business_unit", "request_date"],
+            dtype={ # Explicitly map date type for Glue/Athena
+                'request_date': 'date',
+                'last_updated_date': 'date'
+            },
+            catalog_versioning=True, # Optional: enable Glue versioning
+            schema_evolution=True # Allow schema evolution if needed later
+        )
+        logger.info("Successfully wrote to PIT table.")
 
-1.  **Tell Athena *where* your data files are in S3.**
-2.  **Tell Athena *what* the data looks like (the structure or "schema").**
-3.  **Write standard SQL queries.**
+        # 2. Write to LATEST table (Overwrite specific business_unit partition)
+        #    Use ONLY business_unit as partition key here.
+        logger.info(f"Writing {len(df)} rows to LATEST table: {GLUE_DATABASE}.{LATEST_TABLE_NAME} (overwriting partition for {business_unit_enum.value})")
+        wr.s3.to_parquet(
+            df=df,
+            path=S3_LATEST_PREFIX,
+            dataset=True,
+            database=GLUE_DATABASE,
+            table=LATEST_TABLE_NAME,
+            mode="overwrite_partitions", # Key difference: Overwrites partitions matching data
+            partition_cols=["business_unit"],
+            dtype={ # Explicitly map date type for Glue/Athena
+                'request_date': 'date',
+                'last_updated_date': 'date'
+            },
+            catalog_versioning=True,
+            schema_evolution=True
+        )
+        logger.info("Successfully wrote to LATEST table.")
 
-Athena reads the data *directly* from S3 when you run a query, processes it, and gives you the results. You only pay for the amount of data scanned by your queries.
+    except Exception as e:
+        logger.exception(f"Failed to write data to S3/Glue: {e}")
+        # Consider more specific error handling if needed
+        raise ChaliceViewError(f"Internal server error writing data: {e}")
 
-**What is an Athena "Database"?**
+    return Response(
+        body={'message': f'Successfully processed {len(df)} records for business unit {business_unit_enum.value}.'},
+        status_code=201 # Use 201 Created for successful POST actions
+    )
 
-In Athena (like in many SQL systems), a "database" is just a logical container or namespace to organize your tables. It helps you group related tables together.
+# Example of how to get caller identity if needed inside the function (though not used for logic here)
+# def get_caller_info():
+#     context = app.current_request.context
+#     identity = context.get('identity', {})
+#     caller_arn = identity.get('caller')
+#     user_arn = identity.get('userArn')
+#     # You might parse group names or tags from the ARN or use Cognito identity info
+#     logger.info(f"Caller ARN: {caller_arn}, User ARN: {user_arn}")
+```
 
-*   `df_trusted_${env}`: This name you've chosen suggests:
-    *   `df`: Maybe stands for Data Foundation or Data Framework? (Just a guess)
-    *   `trusted`: Implies the data in this database has gone through some level of validation or cleansing, making it reliable for use (as opposed to maybe a "raw" or "staging" database).
-    *   `${env}`: This is a placeholder (like `dev`, `staging`, `prod`) to separate tables for different deployment environments. So you might have `df_trusted_dev`, `df_trusted_prod`, etc.
+**3. IAM Setup**
 
-Creating a database is simple, usually a one-time command like `CREATE DATABASE df_trusted_dev;`.
+This is crucial for restricting access based on department.
 
-**What is an Athena "Table"?**
+*   **Lambda Execution Role:** When you deploy your Chalice app (`chalice deploy`), it creates an IAM role for the Lambda function. This role needs permissions to:
+    *   Write logs to CloudWatch (`logs:CreateLogGroup`, `logs:CreateLogStream`, `logs:PutLogEvents`).
+    *   Write to the S3 Bucket (`s3:PutObject`, `s3:GetObject`, `s3:DeleteObject` - needed for `overwrite_partitions`, `s3:ListBucket` might be needed depending on wrangler usage). Target the specific bucket: `arn:aws:s3:::df-trusted-prod-data/*` and `arn:aws:s3:::df-trusted-prod-data`.
+    *   Interact with AWS Glue Data Catalog (`glue:GetDatabase`, `glue:CreateTable`, `glue:GetTable`, `glue:UpdateTable`, `glue:CreatePartition`, `glue:BatchCreatePartition`, `glue:GetPartitions`, `glue:BatchGetPartition`). Target the specific database: `arn:aws:glue:REGION:ACCOUNT_ID:database/df_trusted_prod`, `arn:aws:glue:REGION:ACCOUNT_ID:table/df_trusted_prod/*`, `arn:aws:glue:REGION:ACCOUNT_ID:catalog`. `awswrangler` handles table creation/updates, so these are important.
 
-This is the crucial part. An Athena table is **NOT** like a traditional database table that *stores* the data itself. Instead, an Athena table is primarily **metadata**. It's a definition stored in Athena that tells it:
+    You can manage this role via the AWS Console or by configuring it in Chalice's `config.json`.
 
-1.  **Schema:** What are the column names and their data types (e.g., `package_name` is a string, `reference_ids` is an array of integers)?
-2.  **Location:** Which specific folder(s) in S3 contain the data files for this table?
-3.  **Format:** How is the data stored within those files (e.g., Parquet, JSON, CSV)?
-4.  **Partitioning (Optional but important):** How is the data organized into subfolders within the main S3 location? This is key for performance and cost.
+*   **API Gateway IAM Authorization:** You've specified `authorizer=iam()` in Chalice. This tells API Gateway to use AWS IAM credentials to authorize requests.
 
-**Table 1: `security_of_interest_pit` (Point-In-Time) - The Base Table**
+*   **IAM Users/Groups and Policies for Callers:**
+    1.  **Create IAM Groups:** Create groups corresponding to your departments (e.g., `Department-AE`, `Department-CMF`, `Department-ABC`, `Department-GG`, `Department-ADMIN`).
+    2.  **Assign Users:** Assign the IAM users who will call the API to their respective department group.
+    3.  **Create IAM Policies per Department:** This is where the restriction happens. You need a policy for *each* group that allows invoking *only* their specific endpoint path.
 
-*   **Purpose:** To represent *every single record* ever written by your API. If `AE`/`job_1` was updated 5 times, this table will have all 5 entries, allowing you to see the history.
-*   **Type: `EXTERNAL TABLE`**: This keyword explicitly tells Athena, "The data for this table lives *outside* of Athena, in an external location (S3)." This is standard for data lakes built on S3.
+        *Policy Example for `Department-AE` Group:*
+        ```json
+        {
+            "Version": "2012-10-17",
+            "Statement": [
+                {
+                    "Effect": "Allow",
+                    "Action": "execute-api:Invoke",
+                    "Resource": "arn:aws:execute-api:YOUR_REGION:YOUR_ACCOUNT_ID:YOUR_API_ID/YOUR_STAGE/POST/v1/security-of-interest/business-unit/AE"
+                }
+            ]
+        }
+        ```
+        *   **Replace:** `YOUR_REGION`, `YOUR_ACCOUNT_ID`, `YOUR_API_ID`, `YOUR_STAGE` (e.g., `dev`, `prod`). You find the `API_ID` after deploying the Chalice app.
+        *   **Resource ARN:** The key is the `Resource` ARN, which specifically targets the `POST` method on the `/v1/security-of-interest/business-unit/AE` path.
+        *   **Create Similar Policies:** Create analogous policies for `CMF`, `ABC`, `GG`, `ADMIN`, changing the final part of the resource ARN (`/AE`, `/CMF`, etc.).
+    4.  **Attach Policies:** Attach the corresponding policy to each department group (e.g., attach the `AE-InvokePolicy` to the `Department-AE` group).
 
-Let's break down the `CREATE EXTERNAL TABLE` SQL command step-by-step:
+Now, an IAM user in the `Department-CMF` group can *only* successfully call `POST /v1/security-of-interest/business-unit/CMF` (assuming they sign their request correctly with their AWS credentials). Trying to call the `/AE` endpoint will result in a 403 Forbidden error from API Gateway.
+
+**4. Athena Table Schema (DDL)**
+
+`awswrangler` will attempt to create/update these tables in the Glue Data Catalog for you if they don't exist or if the schema changes (because we set `dataset=True`). However, it's good practice to know the DDL. You can also create them manually in Athena first.
+
+*   **`security_of_interest_pit` Table:**
 
 ```sql
--- 1. Command to create a table that points to external data
-CREATE EXTERNAL TABLE `df_trusted_${env}`.`security_of_interest_pit`(
-  -- 2. Define the columns and their data types
-  `package_name` string,           -- The package name provided by the user
-  `reference_ids` array<int>,     -- The list of security IDs (stored as an array/list of integers)
-  `event_timestamp` timestamp,     -- The exact server-side timestamp when the event was processed (for finding the absolute latest)
-  `request_date` date             -- The date the request was made (useful for simple filtering)
-  -- Optional: `request_id` string, `user_id` string -- Could add more tracking info here
-)
--- 3. Define how the data is partitioned in S3
+CREATE EXTERNAL TABLE `df_trusted_prod`.`security_of_interest_pit`(
+  `reference_id` string,
+  `reference_type` string,
+  `package` string,
+  `requested_by` string,
+  `last_updated_by` string,
+  `last_updated_date` date)
 PARTITIONED BY (
-  `business_unit` string,         -- Data is in folders like 'business_unit=AE', 'business_unit=CMF'
-  `year` string,                  -- Within those, folders like 'year=2024'
-  `month` string,                 -- Within those, 'month=05'
-  `day` string                    -- Within those, 'day=16'
-)
--- Note: We use 'string' for partition columns for simplicity, even for year/month/day.
---       Athena understands how to filter these string-based partitions effectively.
-
--- 4. Specify the data format and the library (SerDe) to read/write it
+  `business_unit` string,
+  `request_date` date)
 ROW FORMAT SERDE
   'org.apache.hadoop.hive.ql.io.parquet.serde.ParquetHiveSerDe'
--- This tells Athena to use the Parquet Serializer/Deserializer (SerDe).
--- Think of a SerDe as a translator between Athena's SQL engine and the specific file format (Parquet in this case).
-
--- 5. Define the Input/Output formats (technical requirement for Parquet in Hive DDL)
 STORED AS INPUTFORMAT
   'org.apache.hadoop.hive.ql.io.parquet.MapredParquetInputFormat'
 OUTPUTFORMAT
   'org.apache.hadoop.hive.ql.io.parquet.MapredParquetOutputFormat'
--- These lines are standard boilerplate when using Parquet format.
-
--- 6. Specify the BASE S3 location where all data for this table resides
 LOCATION
-  's3://your-company-datalake-${env}/trusted/security-of-interest/'
--- Athena combines this base LOCATION with the PARTITIONED BY info.
--- When you query WHERE business_unit='AE' AND year='2024' AND month='05' AND day='16',
--- Athena knows to look *only* inside the 's3://.../business_unit=AE/year=2024/month=05/day=16/' folder.
-
--- 7. Optional table properties
+  's3://df-trusted-prod-data/security_of_interest_pit/'
 TBLPROPERTIES (
-  'parquet.compression'='SNAPPY', -- Tells Athena (and potentially writers) that the Parquet files use SNAPPY compression (fast and efficient). Could also be GZIP.
-  'classification'='parquet'      -- A hint for other AWS services like Glue Crawler about the data format.
-);
+  'classification'='parquet',
+  'parquet.compression'='SNAPPY'); -- Or GZIP, etc. awswrangler defaults usually good.
 ```
+*After creating, run `MSCK REPAIR TABLE df_trusted_prod.security_of_interest_pit;` in Athena to discover partitions if you created the table manually before data existed.*
 
-**Partitioning Explained:**
-
-*   **Why Partition?** Imagine you have years of data. If you query for data from `AE` on `2024-05-16`, without partitioning, Athena would have to scan *every single file* in the `s3://.../security-of-interest/` directory to find the relevant records. This is slow and expensive (you pay per byte scanned).
-*   **How it Works:** By partitioning, we physically organize the data in S3 into subfolders based on column values (`business_unit`, `year`, `month`, `day`). The `PARTITIONED BY` clause in the `CREATE TABLE` statement tells Athena about this folder structure.
-*   **Benefit:** When you run a query with a `WHERE` clause that filters on partition columns (e.g., `WHERE business_unit = 'AE' AND year = '2024'`), Athena uses the table definition to figure out the exact S3 folder path (like `.../business_unit=AE/year=2024/`) and *only* scans the files within that specific folder (and its relevant subfolders like `month=05/day=16/`). This drastically reduces the amount of data scanned, making queries faster and cheaper.
-
-**Partition Management (The Catch!)**
-
-Athena needs to know *which specific partitions (folders) exist*. Just creating the folders in S3 isn't enough. When new data arrives (e.g., for `2024-05-17`), you need to tell Athena that the partition `business_unit=AE/year=2024/month=05/day=17/` now exists and should be considered part of the `security_of_interest_pit` table. You have a few options:
-
-1.  **AWS Glue Crawler:** This is an AWS service you can schedule (e.g., run once a day). It scans your S3 location (`s3://.../security-of-interest/`), detects any new folders (partitions) that match the table's structure, and automatically updates Athena's table metadata. **This is often the recommended approach for automated partition management.**
-2.  **`MSCK REPAIR TABLE` Command:** You can manually run the SQL command `MSCK REPAIR TABLE df_trusted_${env}.security_of_interest_pit;` in the Athena query editor (or via a script). This command tells Athena to scan the base S3 location for the table and add metadata for any partitions it finds that aren't already registered. Simpler for infrequent updates or manual processes.
-3.  **Event-Driven (Lambda):** A more advanced setup where an S3 event (when a new file is written) triggers an AWS Lambda function, which then runs an `ALTER TABLE ADD PARTITION ...` command to add the specific new partition metadata immediately. Faster, but more complex to build.
-
-**Table 2: `security_of_interest_latest` - The View**
-
-*   **Purpose:** To show *only the most recent* entry for each unique combination of `business_unit` and `package_name`, based on the `event_timestamp`.
-*   **Type: `VIEW`**: A view is essentially a saved SQL query that acts like a virtual table. It doesn't store any data itself. When you query the view, Athena runs the underlying query against the base table (`security_of_interest_pit`) and returns the results.
-*   **Benefit:** You don't duplicate data. The "latest" logic is calculated dynamically whenever you query the view.
-
-Let's break down the `CREATE OR REPLACE VIEW` SQL command:
+*   **`security_of_interest_latest` Table:**
 
 ```sql
--- 1. Command to create (or replace if it exists) a view
-CREATE OR REPLACE VIEW `df_trusted_${env}`.`security_of_interest_latest` AS
--- 2. The SELECT query that defines what the view returns
-SELECT
-  -- 3. Select the columns you want in the final "latest" view
-  package_name,
-  reference_ids,
-  event_timestamp, -- The timestamp of the latest event
-  request_date,    -- The request date of the latest event
-  business_unit    -- Include the partition column used in the grouping/ranking
-FROM (
-    -- 4. This is an inner query (subquery) that does the hard work of finding the latest record
-    SELECT
-      pit.package_name,
-      pit.reference_ids,
-      pit.event_timestamp,
-      pit.request_date,
-      pit.business_unit, -- Make sure to select the partition columns from the base table
-      -- 5. The magic: ROW_NUMBER() Window Function
-      ROW_NUMBER() OVER (                 -- Assign a sequential number (rank) to each row...
-          PARTITION BY pit.business_unit, pit.package_name -- ...within groups defined by these columns (restart numbering for each unique BU/Package combo)...
-          ORDER BY pit.event_timestamp DESC -- ...ordering the rows within each group by timestamp, newest first.
-      ) as rn                               -- Name this calculated rank 'rn'
-    FROM
-      `df_trusted_${env}`.`security_of_interest_pit` pit -- Query the base table (all history)
-) ranked_pit -- Give the result of the inner query an alias ('ranked_pit')
-WHERE
-  -- 6. Filter the results of the inner query: Keep only rows where the rank is 1
-  rn = 1; -- Since we ordered by timestamp DESC, rn=1 represents the latest record for each group.
+CREATE EXTERNAL TABLE `df_trusted_prod`.`security_of_interest_latest`(
+  `reference_id` string,
+  `reference_type` string,
+  `package` string,
+  `requested_by` string,
+  `last_updated_by` string,
+  `request_date` date,          -- Note: request_date is data, not partition
+  `last_updated_date` date)    -- Note: last_updated_date is data, not partition
+PARTITIONED BY (
+  `business_unit` string)        -- Only partitioned by business_unit
+ROW FORMAT SERDE
+  'org.apache.hadoop.hive.ql.io.parquet.serde.ParquetHiveSerDe'
+STORED AS INPUTFORMAT
+  'org.apache.hadoop.hive.ql.io.parquet.MapredParquetInputFormat'
+OUTPUTFORMAT
+  'org.apache.hadoop.hive.ql.io.parquet.MapredParquetOutputFormat'
+LOCATION
+  's3://df-trusted-prod-data/security_of_interest_latest/'
+TBLPROPERTIES (
+  'classification'='parquet',
+  'parquet.compression'='SNAPPY');
 ```
+*After creating, run `MSCK REPAIR TABLE df_trusted_prod.security_of_interest_latest;` in Athena to discover partitions if you created the table manually before data existed.*
 
-**How the `_latest` View Works:**
+**Explanation Summary:**
 
-1.  **Inner Query:** It looks at the *entire history* (`security_of_interest_pit`).
-2.  **`ROW_NUMBER() OVER(...)`:** This is a powerful "window function."
-    *   `PARTITION BY pit.business_unit, pit.package_name`: It conceptually groups all rows that have the same `business_unit` and `package_name` together.
-    *   `ORDER BY pit.event_timestamp DESC`: Within each group, it sorts the rows based on the `event_timestamp`, putting the most recent one first.
-    *   `ROW_NUMBER()`: It then assigns a rank (1, 2, 3, ...) to each row within its group based on that sorted order. The newest record gets rank 1, the second newest gets rank 2, and so on.
-3.  **Outer Query:** It takes the result of the inner query (which now includes the rank `rn`).
-4.  **`WHERE rn = 1`:** It filters these results, keeping *only* the rows that received rank 1 (the latest record for each `business_unit`/`package_name` combination).
+1.  **Chalice API (`app.py`):** Defines the endpoint, uses IAM authorization, validates path parameter (`business_unit`) and request body (`ApiRequestModel`), transforms data into `DatabaseRow` format, gets the current date.
+2.  **Pydantic Models:** Ensure data consistency and validation. `ApiRequestModel` is what the endpoint expects; `DatabaseRow` is the target schema.
+3.  **AWS Wrangler (`wr.s3.to_parquet`):** Handles writing Pandas DataFrames to S3 as partitioned Parquet files. Critically, it also interacts with the Glue Data Catalog to create/update table schemas and partitions.
+    *   `_pit`: `mode="append"`, partitioned by `business_unit` and `request_date`. New data is added alongside old data.
+    *   `_latest`: `mode="overwrite_partitions"`, partitioned only by `business_unit`. When new data arrives for `AE`, `awswrangler` deletes the existing objects in the `s3://.../business_unit=AE/` prefix and writes the new data, effectively replacing the *entire* dataset for that `business_unit`.
+4.  **IAM:** API Gateway uses IAM roles/users/groups and policies to control *who* can call *which* specific endpoint path (`execute-api:Invoke` action on the specific resource ARN). The Lambda function needs its *own* role to interact with S3 and Glue.
+5.  **Athena:** Uses the Glue Data Catalog tables defined over the S3 Parquet data. Partitioning is key for performance and for the `overwrite_partitions` logic in the `_latest` table.
 
-**In essence:**
+This setup provides a robust, scalable, and secure way to ingest your data, maintain a full history (`_pit`), keep track of the current state (`_latest`), and query it efficiently using Athena, while enforcing departmental access controls at the API layer.
 
-*   `security_of_interest_pit` is the **source of truth**, defined directly over the partitioned S3 data files.
-*   `security_of_interest_latest` is a **convenient, dynamic lens** that uses a SQL query (saved as a view) to show only the current state derived from that source of truth.
+%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
 
-When you query `security_of_interest_latest`, Athena cleverly combines the view's query with your query. If you add `WHERE business_unit = 'AE'`, Athena can often push that filter down to the `security_of_interest_pit` table scan, still leveraging the S3 partitioning for efficiency.
+Okay, let's break down the execution flow step-by-step, starting from the moment the user sends the request:
 
-≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈
-≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈ BREAK ≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈
-≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈
+**Phase 1: Request Initiation & API Gateway Handling**
 
-Okay, let's clarify how the `security_of_interest_latest` view works and answer your question directly.
+1.  **Client Sends Request:** An authorized client (e.g., a script, application, or user via a tool like Postman/curl) crafts an HTTP POST request.
+    *   **Target URL:** `/v1/security-of-interest/business-unit/{business_unit}` (e.g., `/v1/security-of-interest/business-unit/AE`)
+    *   **Method:** `POST`
+    *   **Headers:** Must include AWS Signature Version 4 headers, generated using the client's IAM user/role credentials. This proves the client's identity to AWS.
+    *   **Body:** A JSON payload matching the structure of `ApiRequestModel` (containing the `packages` list).
 
-**The View is NOT a Snapshot, It's a Saved Query Recipe**
+2.  **API Gateway Receives Request:** The request hits the AWS API Gateway endpoint configured by Chalice.
 
-Think of the `CREATE OR REPLACE VIEW security_of_interest_latest AS ...` command like saving a complex search filter or a recipe in a cookbook.
+3.  **IAM Authorization Check (Critical Step):**
+    *   Because the Chalice route is decorated with `@app.route(..., authorizer=authorizer)` where `authorizer` is `IAMAuthorizer()`, API Gateway performs an IAM authorization check *before* invoking the Lambda.
+    *   It extracts the caller's identity from the AWS Signature headers.
+    *   It checks the IAM policies attached to that caller (their IAM user or the assumed role).
+    *   **Verification:** It specifically checks if the policy grants the `execute-api:Invoke` action on the *exact* resource ARN corresponding to this specific request (e.g., `arn:aws:execute-api:REGION:ACCOUNT_ID:API_ID/STAGE/POST/v1/security-of-interest/business-unit/AE`).
+    *   **Decision:**
+        *   **If Denied:** The caller's policy does *not* allow access to this specific path/method. API Gateway immediately stops processing and sends an `HTTP 403 Forbidden` response back to the client. The Lambda function is *never* invoked.
+        *   **If Allowed:** The policy grants permission. API Gateway proceeds to the next step.
 
-*   **The Cookbook:** Your Athena database (`df_trusted_${env}`).
-*   **The Ingredients:** The data stored in S3, represented by the base table `security_of_interest_pit`. This table knows where *all* the historical data files are.
-*   **The Recipe (`security_of_interest_latest` view):** The SQL query you saved using `CREATE VIEW`. This recipe specifically says:
-    1.  "Look at *all* the ingredients (all rows in `security_of_interest_pit`)."
-    2.  "Group them by `business_unit` and `package_name`."
-    3.  "Within each group, find the one with the most recent `event_timestamp`."
-    4.  "Show me only that most recent one for each group."
+**Phase 2: Lambda Function Execution (Chalice App)**
 
-**You Do NOT Need to Re-run the View Definition**
+4.  **API Gateway Invokes Lambda:** API Gateway triggers the backend Lambda function (`update_security_of_interest`) associated with the matched route. It passes:
+    *   The path parameter (`business_unit` = "AE" in our example).
+    *   The request body (the JSON payload).
+    *   Context information (including caller identity, though not used directly in the logic here).
 
-You only run the `CREATE OR REPLACE VIEW ...` command **once** (or again only if you need to *change the logic* of how "latest" is defined).
+5.  **Function Execution Begins:** The Python code in `app.py` starts running within the Lambda environment.
 
-**How Querying the View Works:**
+6.  **Path Parameter Validation:**
+    *   The code receives `business_unit` (e.g., "AE") as a string function argument.
+    *   `business_unit_enum = Department(business_unit.upper())` attempts to convert this string into a member of the `Department` Enum.
+    *   If the string is not a valid member (e.g., "XYZ"), a `ValueError` occurs, the `except` block catches it, logs an error, and raises a `BadRequestError`. Chalice translates this into an `HTTP 400 Bad Request` response sent back through API Gateway.
 
-When you run a query like this:
+7.  **Request Body Parsing & Validation:**
+    *   `app.current_request.json_body` accesses the JSON payload sent by the client.
+    *   `ApiRequestModel.parse_obj(...)` uses Pydantic to:
+        *   Parse the JSON into a Python object.
+        *   Validate that the object's structure and data types conform *exactly* to the `ApiRequestModel` definition (e.g., checks if `packages` is a list, if items have `name` and `references`, etc.).
+    *   If validation fails (e.g., missing required field, wrong data type), a `ValidationError` occurs, the `except` block catches it, logs the specific validation errors, and raises a `BadRequestError` (leading to an `HTTP 400 Bad Request` response).
 
-```sql
-SELECT reference_ids
-FROM df_trusted_${env}.security_of_interest_latest
-WHERE business_unit = 'AE'
-  AND package_name = 'job_1';
-```
+8.  **Data Transformation & Enrichment:**
+    *   `current_date = date.today()` captures the date the Lambda function is running.
+    *   An empty list `db_rows` is created to hold the flattened data.
+    *   The code iterates through each `package` in the validated `request_data.packages`.
+    *   For each `package`, it iterates through each `reference` in `package.references`.
+    *   Inside the inner loop (for each reference), it builds a dictionary representing a single row for the database:
+        *   Copies `id` and `type` from the reference.
+        *   Copies `name` from the package.
+        *   Adds `business_unit`, `requested_by`, `last_updated_by` using the validated `business_unit_enum` from the path parameter.
+        *   Adds `request_date` and `last_updated_date` using the `current_date`.
+    *   `DatabaseRow(**row_data).dict()` validates this constructed dictionary against the `DatabaseRow` model and converts it back to a dictionary. This ensures the data going into the DataFrame matches the target schema.
+    *   This row dictionary is appended to the `db_rows` list.
 
-Here's what Athena does behind the scenes *every time you run this query*:
+9.  **DataFrame Creation:**
+    *   `df = pd.DataFrame(db_rows)` creates a Pandas DataFrame from the list of dictionaries. Each dictionary becomes a row in the DataFrame.
+    *   Data types are explicitly set (dates to date objects, enums to strings) to ensure compatibility with Parquet and Athena.
+    *   An empty DataFrame with the correct schema is created if `db_rows` is empty.
 
-1.  **Looks up the View:** Athena sees you're querying `security_of_interest_latest`. It knows this isn't a real table holding data, but a view (a saved query/recipe).
-2.  **Retrieves the Recipe:** It retrieves the stored SQL definition of the view (the complex query with `ROW_NUMBER()` we defined earlier).
-3.  **Combines Queries:** It effectively substitutes the view's definition into your query. It also intelligently combines your `WHERE` clause (`business_unit = 'AE' AND package_name = 'job_1'`) with the view's logic.
-4.  **Optimizes:** Athena's query planner analyzes the combined query. Crucially, it sees the filter `business_unit = 'AE'` and knows that the underlying `security_of_interest_pit` table is partitioned by `business_unit`. It will push this filter down.
-5.  **Executes Against Base Table:** Athena runs the combined, optimized query against the `security_of_interest_pit` table.
-    *   Because of partitioning and the pushed-down filter, it **only scans the S3 data** located in the `s3://.../business_unit=AE/` partitions.
-    *   It reads the data for `package_name = 'job_1'` within those AE partitions.
-    *   It applies the `ROW_NUMBER()` logic *to the data it just read* to find the row with the maximum `event_timestamp` for that specific package (`job_1` in `AE`).
-    *   It filters to keep only the row where the calculated rank (`rn`) is 1.
-6.  **Returns Results:** It returns the `reference_ids` from that single, latest row it found.
+**Phase 3: Data Persistence (S3 & Glue via AWS Wrangler)**
 
-**In Simple Terms:**
+10. **Write to PIT Table (Append):**
+    *   `wr.s3.to_parquet(...)` is called for the Point-in-Time (PIT) table.
+    *   **Action:** It writes the DataFrame `df` to S3.
+    *   **Location:** `s3://df-trusted-prod-data/security_of_interest_pit/`
+    *   **Partitioning:** Uses `partition_cols=["business_unit", "request_date"]`. The data is written into nested folders like `.../business_unit=AE/request_date=2023-10-27/`.
+    *   **Mode:** `mode="append"`. This crucial setting tells `awswrangler` to *add* new Parquet files to the specified location/partition without deleting any existing files.
+    *   **Glue Integration:** (`dataset=True`, `database=...`, `table=...`) `awswrangler` also interacts with the AWS Glue Data Catalog:
+        *   It ensures the `df_trusted_prod` database and `security_of_interest_pit` table exist (creating/updating if necessary, based on DataFrame schema).
+        *   It registers the *new partitions* (e.g., `business_unit=AE`, `request_date=2023-10-27`) in the Glue table, pointing them to the newly written S3 files.
 
-Querying the view is like asking Athena: "Please execute the 'find the latest' recipe right now, using the current ingredients in the `pit` table, but only focus on the ingredients for 'AE' and 'job_1'."
+11. **Write to LATEST Table (Overwrite Partition):**
+    *   `wr.s3.to_parquet(...)` is called again, this time for the "Latest" table.
+    *   **Action:** It writes the *same* DataFrame `df` to S3 again.
+    *   **Location:** `s3://df-trusted-prod-data/security_of_interest_latest/`
+    *   **Partitioning:** Uses `partition_cols=["business_unit"]`. Data is written into folders like `.../business_unit=AE/`.
+    *   **Mode:** `mode="overwrite_partitions"`. This crucial setting tells `awswrangler`:
+        1.  Identify the partition(s) present in the input DataFrame `df` (in this case, only `business_unit=AE`).
+        2.  **Delete all existing S3 objects** under the corresponding S3 prefix (e.g., `s3://df-trusted-prod-data/security_of_interest_latest/business_unit=AE/`).
+        3.  Write the *new* Parquet files from the DataFrame `df` into that now-empty S3 prefix.
+    *   **Glue Integration:** `awswrangler` ensures the `df_trusted_prod` database and `security_of_interest_latest` table exist in Glue and that the partition (`business_unit=AE`) points to the newly written S3 data.
 
-**Key Takeaway:**
+**Phase 4: Response Generation & Return**
 
-The view is **dynamic**. It doesn't store any data itself. Every time you query the view, it re-runs its underlying logic against the **current data** present in the `security_of_interest_pit` table (which points to your S3 files). So, if new data for `AE`/`job_1` arrived in S3 just seconds ago (and the partitions were updated), querying the view *now* will reflect that latest data automatically. You just run your simple `SELECT ... FROM security_of_interest_latest WHERE ...` query whenever you need the current state.
+12. **Prepare Success Response:** If both `to_parquet` calls complete without exceptions:
+    *   A success message dictionary is created.
+    *   `Response(body=..., status_code=201)` constructs the final HTTP response object. `201 Created` is appropriate for a successful POST that results in resource creation/update.
 
-≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈
-≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈ BREAK ≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈
-≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈
+13. **Handle Potential Errors:** If any exception occurs during the S3/Glue writing process (e.g., S3 permissions issue, Glue API error):
+    *   The `except Exception as e:` block catches the error.
+    *   The error is logged using `logger.exception(...)`.
+    *   A `ChaliceViewError` is raised. Chalice translates this into an `HTTP 500 Internal Server Error` response.
 
-Okay, let's analyze the performance characteristics of using an Athena View with `ROW_NUMBER()` for your `security_of_interest_latest` use case, considering millions of rows.
+14. **Lambda Returns Response:** The Lambda function finishes and returns the prepared `Response` object (either the 201 success or a 500/400 error) back to API Gateway.
 
-**Short Answer:**
+15. **API Gateway Returns Response:** API Gateway forwards the response (status code, headers, body) received from the Lambda function back to the original client that made the request.
 
-For your *most common and critical* query pattern – filtering by `business_unit` (e.g., `WHERE business_unit = 'AE'`) – the view approach should be **reasonably performant**, likely completing in seconds to perhaps low minutes, even with millions of rows *in total*. Performance depends heavily on how much data exists *within the specific partition(s)* being queried. Querying without filters will be slow.
-
-**Detailed Breakdown:**
-
-1.  **The Power of Partition Pruning:**
-    *   This is the **most important factor**. Your `security_of_interest_pit` table is partitioned by `business_unit`, `year`, `month`, `day`.
-    *   When you query the `security_of_interest_latest` view with a filter like `WHERE business_unit = 'AE'`, Athena is smart enough to apply this filter *before* scanning S3 data.
-    *   It will **only scan the data** located under the `s3://.../business_unit=AE/` prefix in your S3 bucket. It completely ignores data for `CMF`, `XYZ`, etc.
-    *   This dramatically reduces the amount of data Athena needs to read and process. If 'AE' accounts for 10% of your total data, the query instantly becomes roughly 10x faster than scanning everything.
-
-2.  **Efficient Data Format (Parquet):**
-    *   You're planning to use Parquet. This is excellent for Athena. Parquet is columnar, meaning Athena only needs to read the specific columns required by the query from S3.
-    *   For the view's underlying `ROW_NUMBER()` calculation, it primarily needs `business_unit`, `package_name`, and `event_timestamp`. For the final result, it reads the columns you `SELECT` (e.g., `reference_ids`).
-    *   It avoids reading large `reference_ids` arrays for rows that aren't the latest or don't match the final `SELECT`, saving significant I/O and processing time compared to row-based formats like JSON or CSV.
-    *   Compression (like SNAPPY) further reduces the amount of data transferred from S3.
-
-3.  **The Cost of the Window Function (`ROW_NUMBER()`):**
-    *   While partition pruning limits the *input data*, the `ROW_NUMBER()` function still needs to process all the rows *within the scanned partitions* to find the latest `event_timestamp` for each `package_name`.
-    *   This involves sorting or hashing the data based on the `PARTITION BY` (`business_unit`, `package_name`) and `ORDER BY` (`event_timestamp DESC`) clauses within Athena's execution engine.
-    *   **This is the main computational overhead.** If a single `business_unit` (like 'AE') has millions of historical records across thousands of `package_name`s spanning years, this step will take time. However, Athena is designed to handle large datasets and perform such operations distributedly.
-
-4.  **Impact of Filters:**
-    *   `WHERE business_unit = 'AE'`: **Highly effective.** Reduces S3 scan via partition pruning.
-    *   `WHERE business_unit = 'AE' AND package_name = 'job_1'`: **Still benefits hugely from `business_unit` partitioning.** The `package_name` filter helps reduce the *output* after the `ROW_NUMBER()` calculation, but doesn't significantly reduce the initial data scan or the window function's workload compared to filtering by `business_unit` alone (since `package_name` is not a partition key). The performance will be very similar to just filtering by `business_unit`.
-    *   `WHERE business_unit = 'AE' AND request_date > '...'`: **Effective.** Leverages date partitioning (`year`, `month`, `day`) *in addition* to `business_unit` partitioning, further reducing the scan scope. *However*, finding the absolute latest might still require looking back further than the date filter unless you are certain the latest record falls within that date range. The `ROW_NUMBER()` still needs to consider all relevant history for the `business_unit` partition to guarantee correctness for the "latest" logic.
-    *   `SELECT * FROM security_of_interest_latest;` (No filters): **Potentially very slow and expensive.** Athena would have to scan *all* partitions and process the `ROW_NUMBER()` function across the entire dataset. Avoid this if possible on large tables.
-
-5.  **Data Volume per Partition:**
-    *   Millions of rows *in total* is generally fine.
-    *   Performance becomes more dependent on the number of rows *per partition being queried*. If one `business_unit` has tens or hundreds of millions of historical rows, queries filtered to that unit will naturally take longer than one with only thousands.
-
-**Potential Issues and Mitigations:**
-
-*   **Small File Problem:** If your API writes very frequent, small Parquet files, this can slow down Athena (overhead in listing/opening many files). Implement a compaction strategy:
-    *   Use Kinesis Data Firehose to buffer data and write larger files.
-    *   Run a periodic AWS Glue ETL job or Lambda function to merge small files into larger ones (e.g., once per day). Target file sizes between 128MB and 1GB.
-*   **Very High Data Volume within a Partition:** If queries for a specific `business_unit` become too slow (e.g., consistently taking many minutes) due to immense historical data for that unit, you *could* consider:
-    *   **Materialization:** Create a *separate physical table* (not a view) that stores *only* the latest state. An ETL job (e.g., daily Glue job) would run the `ROW_NUMBER()` logic on the `pit` table and overwrite this "materialized latest" table. Queries against this table would be extremely fast (just reading the pre-calculated state), but the data would only be as fresh as the last ETL run. This adds complexity and infrastructure cost.
-
-**Conclusion:**
-
-For typical queries filtered by `business_unit`, the Athena view using `ROW_NUMBER()` over a partitioned Parquet dataset is a standard and generally **performant pattern**, even with millions of rows overall. Expect query times in the seconds to low minutes range. Ensure you manage file sizes (avoid too many small files) and rely heavily on the `business_unit` partition filter in your queries. Avoid querying the view without filters on large datasets.
-
-≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈
-≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈ BREAK ≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈
-≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈
-
-Okay, this clarifies the priority. You need good performance for specific `(business_unit, package_name)` lookups on the `_latest` view *during the current day*, even if those lookups aren't constant.
-
-Given this, the **Buffering/Batching approach (using Kinesis Data Firehose) is the strongly recommended solution.**
-
-Here's why the "1 API Call -> 1 File + Daily Compaction" model falls short for *your specific need*:
-
-1.  **Intra-day Small File Problem:** When you query for `AE`/`job_1` at, say, 2 PM on Tuesday, the `_latest` view needs to look at the `security_of_interest_pit` data for Tuesday. With the compaction model, the Tuesday partition (`.../day=Tuesday/`) will contain potentially hundreds or thousands of small files generated by every API call made for `AE` since midnight.
-2.  **Athena Overhead:** Even though you only want the latest for `job_1`, Athena first needs to identify all files in the `.../business_unit=AE/.../day=Tuesday/` partition. It then has to open many of these small files to find the relevant records for `job_1` and determine which one has the highest `event_timestamp`. This process of listing and opening many small files is inherently slow in Athena and will likely not meet your definition of "good performance," even if the final result is small.
-3.  **Compaction Doesn't Help Intra-day:** The daily compaction job will optimize Tuesday's data *tonight*, making queries for Tuesday fast *tomorrow*. It doesn't help performance *during* Tuesday.
-
-**Why Kinesis Data Firehose (or similar batching) is Better Here:**
-
-1.  **Optimized Files from the Start:** Firehose buffers the records sent by your API (e.g., for 5-15 minutes or until 64-128MB accumulates). It then writes these buffered records as a single, larger Parquet file to the correct S3 partition (`.../business_unit=AE/.../day=Tuesday/`).
-2.  **Reduced File Count:** Instead of thousands of tiny files accumulating during the day, you'll have far fewer, larger files (e.g., one new file every 5-15 minutes).
-3.  **Faster Athena Scans:** When you query for `AE`/`job_1` at 2 PM, Athena still scans the `.../business_unit=AE/.../day=Tuesday/` partition, but it only needs to list and open a handful of larger files. This significantly reduces the overhead.
-4.  **Good Intra-day Performance:** While the `ROW_NUMBER()` calculation still needs to happen, the dominant bottleneck (dealing with excessive small files) is removed. This should provide the good intra-day query performance you need for those specific lookups.
-
-**Implementation Sketch with Firehose:**
-
-1.  **API:** Receives `POST /api/v1/security-of-interest/AE` with `[{"package_name": "job_1", "reference_ids": [123]}]`.
-2.  **API Processing:**
-    *   Validates request.
-    *   Generates `event_timestamp`.
-    *   Constructs a JSON record (or multiple records if the request has multiple packages):
-        ```json
-        {
-          "business_unit": "AE",
-          "package_name": "job_1",
-          "reference_ids": [123],
-          "event_timestamp": "2024-05-17T14:05:10.123Z", // ISO 8601 format often good
-          "request_date": "2024-05-17"
-          // Derive partitioning fields year, month, day if needed for Firehose partitioning
-          "partition_year": "2024",
-          "partition_month": "05",
-          "partition_day": "17"
-        }
-        ```
-3.  **API Sends to Firehose:** Uses AWS SDK's `PutRecordBatch` API call to send the record(s) to your configured Firehose Delivery Stream.
-4.  **Firehose Configuration:**
-    *   **Source:** Direct PUT (from your API).
-    *   **Data Transformation:** Enabled (optional, but recommended for schema enforcement/minor cleanup via a Lambda function if needed).
-    *   **Record Format Conversion:** Enabled. Convert source JSON to **Parquet**. Specify the schema.
-    *   **Destination:** S3 Bucket (`s3://your-company-datalake-${env}/trusted/security-of-interest/`).
-    *   **S3 Buffering:** Configure hints (e.g., buffer size 128 MiB, buffer interval 300 seconds - adjust based on expected volume).
-    *   **Dynamic Partitioning:** Enabled. Use inline parsing to extract values from the JSON records to create the S3 prefix: `partitionPrefix=business_unit=!{partitionKeyFromQuery:business_unit}/year=!{partitionKeyFromQuery:partition_year}/month=!{partitionKeyFromQuery:partition_month}/day=!{partitionKeyFromQuery:partition_day}/` (Note: `!{partitionKeyFromQuery:...}` tells Firehose to get values from the record data).
-    *   **S3 Compression:** `SNAPPY` (or GZIP).
-5.  **Athena:** Your `security_of_interest_pit` table definition and `security_of_interest_latest` view remain the same. Use a Glue Crawler or `MSCK REPAIR TABLE` to update partitions (though Firehose creating files should trigger event notifications you could potentially use for more real-time partition adds if needed).
-
-This setup directly addresses your need for good performance on current-day data for specific lookups by preventing the small file problem from occurring in the first place.
+This completes the lifecycle of a single request, covering authorization, validation, transformation, dual-table persistence with different strategies (append vs. overwrite), and response handling.
