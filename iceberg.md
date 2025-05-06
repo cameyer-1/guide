@@ -1,18 +1,24 @@
+
 ───────────────────────────────────────────────────────────────
 ───────────────────────────────────────────────────────────────
 ───────────────────────────────────────────────────────────────
+
 Parse through the pyiceberg documentation, if you understand everything, say yes:
+
 ───────────────────────────────────────────────────────────────
 ───────────────────────────────────────────────────────────────
 ───────────────────────────────────────────────────────────────
+
 Design a python project that does the following:
 1) Users can define iceberg tables (with the absolutely necessary fields, ID numbers and all that should be done implicitly) and should be user-friendly. These definitions will be defined with YAML files
 2) These yaml files can be ingested by this python project and will create a iceberg table in AWS such that it'll appear in AWS Glue and is query-able with AWS Athena
 3) There will also be a python library that provides users with methods to do regular iceberg functions like insert/update/upsert/delete/read data
 4) The project should be modular and easy expandable. Something you would expect from a senior principle staff engineer with years of experience designing projects
+
 ───────────────────────────────────────────────────────────────
 ───────────────────────────────────────────────────────────────
 ───────────────────────────────────────────────────────────────
+
 Okay, let's design a robust and extensible Python project for managing Iceberg tables defined via YAML, targeting AWS Glue and S3. This design emphasizes modularity, separation of concerns, and adherence to good engineering practices.
 
 **Project Name:** `iceberg_table_manager` (or similar)
@@ -263,13 +269,17 @@ identifier_fields:
     ```
 
 This design provides a solid foundation that meets the requirements and is built for future growth and maintenance.
+
 ───────────────────────────────────────────────────────────────
 ───────────────────────────────────────────────────────────────
 ───────────────────────────────────────────────────────────────
+
 Is there a way to define a primary key for the table? Like lets say two columns together form a primary key that uniquely identifies a row in the table. Does that work?
+
 ───────────────────────────────────────────────────────────────
 ───────────────────────────────────────────────────────────────
 ───────────────────────────────────────────────────────────────
+
 Yes, absolutely. While Apache Iceberg doesn't use the term "primary key" in the exact same way as a relational database (it doesn't automatically enforce uniqueness on simple appends), it has a mechanism specifically for uniquely identifying rows for operations like **upserts** and **equality deletes**. This is crucial for managing data at the row level in V2 tables.
 
 This mechanism is the **`identifier_fields`** property in the table's metadata.
@@ -380,15 +390,19 @@ Yes, you can define a logical primary key using `identifier_fields` in the YAML.
 2.  Ensure the table is explicitly set to `format-version: 2` in the YAML properties.
 3.  Update the `schema_builder` in your Python project to look up the field IDs for these columns and pass them to the `Schema` constructor.
 4.  Use operations like `ManagedTable.upsert()` which leverage these identifier fields.
+
 ───────────────────────────────────────────────────────────────
 ───────────────────────────────────────────────────────────────
 ───────────────────────────────────────────────────────────────
+
 You mention that: "Important Distinction: Unlike an RDBMS primary key, identifier_fields do not prevent you from writing duplicate rows using a standard append operation. Their purpose is to allow operations like upsert to find existing rows based on these fields and decide whether to update them or insert a new row. Equality deletes also use these fields to find rows to remove."
 
 What about when im making SELECt queries? Like if session_id and event_timestamp make up a key and i query for a particular session_id, event_timestamp pair, its going to give me multiple rows? I don't want that
+
 ───────────────────────────────────────────────────────────────
 ───────────────────────────────────────────────────────────────
 ───────────────────────────────────────────────────────────────
+
 You are absolutely right to raise this concern. My previous explanation focused on the *write-time* behavior and the *purpose* of `identifier_fields` for upserts/deletes, but didn't fully address the read-time implications if duplicates exist.
 
 Here's a breakdown of the situation and how to handle it:
@@ -438,13 +452,17 @@ Given the goal of providing a user-friendly Python library:
 *   **Initial Load:** For the very first population of the table, `append` or `overwrite` is fine. It's the subsequent modifications where `upsert` becomes crucial for maintaining uniqueness.
 
 In summary: Don't think of `identifier_fields` as a constraint like an RDBMS primary key, but as a *definition* used by specific operations (`upsert`, equality deletes) to identify rows. To guarantee uniqueness visible to `SELECT`, you must use write operations that leverage this definition, primarily `upsert`.
+
 ───────────────────────────────────────────────────────────────
 ───────────────────────────────────────────────────────────────
 ───────────────────────────────────────────────────────────────
+
 Does this mean reads aren't performant?
+
 ───────────────────────────────────────────────────────────────
 ───────────────────────────────────────────────────────────────
 ───────────────────────────────────────────────────────────────
+
 No, the fact that `append` doesn't enforce uniqueness **does not inherently mean that reads are not performant** in Iceberg. Iceberg is specifically designed for highly performant reads on large datasets, primarily through **metadata pruning**.
 
 Here's why reads remain performant and how the duplicate issue relates:
@@ -474,6 +492,8 @@ Iceberg's read performance primarily comes from **avoiding reading unnecessary d
 *   If you need unique results, using `upsert` for writes is the recommended way to manage this within Iceberg, maintaining good read performance for queries against the current snapshot.
 *   If you allow duplicates via `append` and handle them at query time, the performance impact comes from the *query processing step* (e.g., the window function), not typically from the initial Iceberg data loading/scanning phase being inherently slow.
 *   Regular table maintenance (compaction) is important, especially for tables with many updates/deletes, to optimize read performance further by managing file sizes and applying deletes.
+
 ───────────────────────────────────────────────────────────────
 ───────────────────────────────────────────────────────────────
 ───────────────────────────────────────────────────────────────
+
