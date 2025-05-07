@@ -25,9 +25,9 @@ The row level comparison will also include hyperlinks to other markdown files (t
 - For "how many keys exist in the second table but are missing from the first table", there should be a hyperlink to another markdown file that contains all the rows in the second table that have keys missing from the first table.
 - For "how many keys exist in the first table but are missing from the second table", there should be a hyperlink to another markdown file that contains all the rows in the first table that have keys missing from the second table.
 
-────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
-────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
-────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+─────────────────────────────────────────────
+─────────────────────────────────────────────
+─────────────────────────────────────────────
 
 Okay, here's a PySpark script that implements the table comparison and markdown report generation as you've described.
 
