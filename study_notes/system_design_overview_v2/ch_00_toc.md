@@ -1,12 +1,5 @@
 ### **The Comprehensive System Design Interview Guide (Table of Contents)**
 
-Based on this interview and the broader landscape of system design, here is the table of contents for a comprehensive guide to help engineers succeed.
-
-**Introduction: It's Not About The Right Answer**
-*   The Goal: Assessing Your Thought Process
-*   Why Trade-offs Are the Key to Everything
-*   How to Drive the Conversation
-
 **Part I: The First 10 Minutes - Laying The Foundation**
 
 *   **Chapter 1: The Art of Scoping**
